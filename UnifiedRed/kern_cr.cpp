@@ -5104,20 +5104,22 @@ static const char *accelGuardMissLast;
 // on a null sDMA channel at +0x28, in a panic of Apple's that carries no report. The same 12 instructions in 13.7.7,
 // 14.8.9 and 15.8.1 (checked where it's routed): drop the update count at +0x3C and, at 0, have the channel flush
 // (vtable +0x140 ready?, +0x158, then +0x160 with 0). Its first 14 bytes hold a branch target, so it can't be wrapped;
-// this copy runs instead, and a null channel panics with the report. -crnovmmcheck leaves Apple's.
+// this copy runs instead, and returns 0 when the channel is null instead of faulting or panicking. -crnovmmcheck leaves Apple's.
 static uint64_t wrapEndVMPTUpdate(void *that) {
+	if (!that)
+		return 0;
 	auto *self = static_cast<uint8_t *>(that);
 	auto &count = *reinterpret_cast<int32_t *>(self + 0x3C);
 	if (--count != 0)
 		return 0;
 	auto *channel = *reinterpret_cast<void **>(self + 0x28);
 	if (!channel)
-		CRDriver::vmmPanic(that);
+		return 0;
 	if (!vfunc<uint32_t (*)(void *)>(channel, 0x140)(channel))
 		return 0;
 	vfunc<void (*)(void *)>(channel, 0x158)(channel);
 	channel = *reinterpret_cast<void **>(self + 0x28);
-	return vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0);
+	return channel ? vfunc<uint64_t (*)(void *, uint32_t)>(channel, 0x160)(channel, 0) : 0;
 }
 static bool wrapPowerUpHWEngines(void *that);
 
