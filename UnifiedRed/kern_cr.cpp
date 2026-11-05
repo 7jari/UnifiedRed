@@ -806,6 +806,10 @@ static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.
 static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily",
 	"/System/Library/Extensions/IOPCIFamily.kext/IOPCIFamily"};
 static const char *pathBacklight[] {"/System/Library/Extensions/AppleBacklight.kext/Contents/MacOS/AppleBacklight"};
+static const char *pathIOAcceleratorFamily2[] {
+	"/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/MacOS/IOAcceleratorFamily2",
+	"/System/Library/Extensions/IOAcceleratorFamily2.kext/IOAcceleratorFamily2"
+};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
@@ -818,6 +822,7 @@ enum KextIndex : size_t {
 	KextAgdp,
 	KextPci,
 	KextBacklight,
+	KextIOAcceleratorFamily2,
 	KextCount,
 };
 
@@ -848,6 +853,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	// OSBundleRequired Safe Boot: in the boot KC, loaded before Lilu runs.
 	[KextBacklight] = {"com.apple.driver.AppleBacklight", pathBacklight, arrsize(pathBacklight), {true}, {},
 		KernelPatcher::KextInfo::Unloaded},
+	[KextIOAcceleratorFamily2] = {"com.apple.iokit.IOAcceleratorFamily2", pathIOAcceleratorFamily2,
+		arrsize(pathIOAcceleratorFamily2), {true}, {}, KernelPatcher::KextInfo::Unloaded},
 };
 
 // Brightness (test): AppleIntelPanelA on SSDT-PNLF is attached and the framebuffer answers 'bklt', but the panel gets
@@ -1616,6 +1623,62 @@ static void wrapRingFlush(void *that);
 static bool wrapVceRegLoc(void *that);
 static bool wrapVceLlqRegLoc(void *that);
 
+static mach_vm_address_t orgFreeToPrepareMapping;
+static bool wrapFreeToPrepareMapping(void *that, void *map) {
+	static uint32_t failLogCount = 0;
+	if (orgFreeToPrepareMapping) {
+		bool ok = FunctionCast(wrapFreeToPrepareMapping, orgFreeToPrepareMapping)(that, map);
+		if (ok)
+			return true;
+	}
+	// For APU UMA architecture: VRAM and system memory are unified in physical RAM (carveout).
+	// If the original discrete VRAM wiring check fails, force true so that
+	// IOAccelDisplayPipe::init_framebuffer_resource succeeds and WindowServer can scan out.
+	if (failLogCount < 16) {
+		failLogCount++;
+		diskLogEvent("freeToPrepareMapping: that=%p map=%p failed in original -> forcing true for UMA scanout", that, map);
+	}
+	return true;
+}
+
+static mach_vm_address_t orgMoveMemoryToHead;
+static void wrapMoveMemoryToHead(void *that, void *vidMem) {
+	if (!that || !vidMem) {
+		static uint32_t nullWarn;
+		if (nullWarn++ < 16)
+			diskLogEvent("moveMemoryToHead: trapped null pointer that=%p vidMem=%p, avoiding panic", that, vidMem);
+		return;
+	}
+	if (orgMoveMemoryToHead)
+		FunctionCast(wrapMoveMemoryToHead, orgMoveMemoryToHead)(that, vidMem);
+}
+
+static void patchIOAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	KernelPatcher::RouteRequest requestFree {
+		"__ZN22IOGraphicsAccelerator220freeToPrepareMappingEP16IOAccelMemoryMap",
+		wrapFreeToPrepareMapping,
+		orgFreeToPrepareMapping
+	};
+	if (routeChecked(patcher, index, requestFree, slide, size)) {
+		SYSLOG("cr", "IOAccelerator: routed freeToPrepareMapping successfully");
+	} else {
+		SYSLOG("cr", "IOAccelerator: failed to route freeToPrepareMapping (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+
+	KernelPatcher::RouteRequest requestMove {
+		"__ZN20IOAccelVidMemoryList16moveMemoryToHeadEP16IOAccelVidMemory",
+		wrapMoveMemoryToHead,
+		orgMoveMemoryToHead
+	};
+	if (routeChecked(patcher, index, requestMove, slide, size)) {
+		SYSLOG("cr", "IOAccelerator: routed moveMemoryToHead successfully");
+	} else {
+		SYSLOG("cr", "IOAccelerator: failed to route moveMemoryToHead (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
 		if (kexts[i].loadIndex != index)
@@ -1699,6 +1762,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				traceKext(patcher, index, slide, size, i);
 		} else if (i == KextRadeonX4000HWLibs && !checkKernelArgument("-crnoaccel"))
 			traceKext(patcher, index, slide, size, i);
+		else if (i == KextIOAcceleratorFamily2)
+			patchIOAccelerator(patcher, index, slide, size);
 		return;
 	}
 }
@@ -9345,6 +9410,16 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	auto read = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes);
 	auto write = FunctionCast(wrapAuxWriteBytes, callback->orgAuxWriteBytes);
 	assrProbe(that, flags, read);
+
+	// Intercept DPCD 0x600 (SET_POWER): Prevent AGDP PMDisplaySleep from shutting off internal eDP panel (D3 sleep 0x01)
+	if (address == 0x600 && length >= 1 && data && data[0] == 0x01) {
+		diskLogEvent("dpcd write 600 = 01 (D3 sleep) BLOCKED for internal eDP panel, enforcing D0 (0x02)");
+		uint8_t d0 = 0x02;
+		IOReturn r = write(that, 0x600, 1, &d0, flags);
+		dpcdRecord(0x600, 1, true, &d0, r);
+		return kIOReturnSuccess;
+	}
+
 	// Wake #27 (log 1793356172): at the start of training (TPS1) after the wake LVTMA_PWRSEQ_CNTL read 0x11 against the
 	// boot's 0x20211 (SYNCEN_OVRD and DIGON_OVRD; SYNCEN gates the transmitter's data output) and DIG_FE_CNTL 0 against
 	// 0x1000000 (DIG_SYMCLK_FE_ON), and clock recovery failed every time. In a wake session, just before Apple starts
